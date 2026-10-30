@@ -215,8 +215,11 @@ def worker_route(policy, construct):
     if (api_mode == 'chat_completions' and runtime.get('provider') != 'custom'
             and not (frozen.get('model') or {}).get('api_mode')):
         api_mode = None
+    # The pool rides with the key: the turn loop rotates on it (429 quota wall, expired OAuth
+    # token), and ``recover_with_credential_pool`` returns at once on ``agent._credential_pool
+    # is None`` — a key alone re-sends the exhausted credential until the run fails.
     return {'api_key': construct['api_key'] or runtime.get('api_key'), 'base_url': runtime.get('base_url'),
-            'api_mode': api_mode}
+            'api_mode': api_mode, 'credential_pool': runtime.get('credential_pool')}
 
 
 def checkpoint_agent_kwargs(config):

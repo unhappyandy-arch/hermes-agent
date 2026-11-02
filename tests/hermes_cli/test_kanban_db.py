@@ -565,6 +565,144 @@ def test_respawn_guard_blocker_auth_only_for_unsuccessful_latest_runs(
         assert kbd.check_respawn_guard(conn, tid, lane="review") == expected
 
 
+def test_respawn_guard_changes_requested_stale_rate_limit_stamp_ready_lane(
+    kanban_home, monkeypatch,
+):
+    """复核打回（``changes_requested``）后重排，旧限流文本不得挡死 ready 道。
+
+    与 #119070 同族、同判据位，落在 ready 道：run N 被 crash sweep 判
+    ``rate_limited``（stamp ``last_failure_error = "… rate-limited (quota
+    wall) …"``）→ 重排 → run N+1 成功 ``request_review`` → 复核 run N+2 走
+    ``request_changes`` 打回，落库 ``outcome=changes_requested``、卡回 ready。
+    ``request_review`` / ``request_changes`` 都按设计保留
+    ``last_failure_error``（失败连击账只由 ``complete_task`` 清零），于是若
+    guard 的成功终态白名单不含 ``changes_requested``，ready 道会把旧限流文本
+    读成「本次」额度阻塞并返回 ``blocker_auth``，打回后的实现卡永远派不出
+    worker，只能靠人工 ``reassign --reclaim`` 清账。
+    """
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = int(time.time())
+    stale = (
+        "pid 24320 exited rate-limited (quota wall) "
+        "— requeued without counting a failure"
+    )
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="changes_requested after rate limit", assignee="implementer",
+        )
+
+        # run 1：被限流的那次尝试（已由 crash sweep 收尾）。
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        conn.execute(
+            "UPDATE task_runs SET outcome='rate_limited', status='rate_limited', "
+            "ended_at=? WHERE id=?",
+            (now - 900, claimed.current_run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, worker_started_at=NULL, "
+            "last_failure_error=? WHERE id=?",
+            (stale, tid),
+        )
+        conn.commit()
+
+        # run 2：重排后成功转复核；旧文本按设计保留。
+        claimed2 = kb.claim_task(conn, tid)
+        assert claimed2 is not None
+        assert kb.request_review(
+            conn, tid, summary="implementation ready for review",
+            expected_run_id=claimed2.current_run_id,
+        )
+        after_review = kb.get_task(conn, tid)
+        assert after_review is not None and after_review.status == "review"
+        # 拉开时间戳：真实序列里三次 run 相隔数分钟，同一秒收尾会让
+        # ``ORDER BY ended_at DESC`` 出现并列，测试就不再确定。
+        conn.execute(
+            "UPDATE task_runs SET ended_at=? WHERE id=?",
+            (now - 60, claimed2.current_run_id),
+        )
+        conn.commit()
+
+        # run 3：复核打回，卡回 ready，旧文本仍在（缺陷前提）。
+        review = kb.claim_review_task(conn, tid)
+        assert review is not None
+        ok, implementer = kb.request_changes(
+            conn, tid, reason="补一条 RED 用例再交",
+            expected_run_id=review.current_run_id,
+        )
+        assert ok is True and implementer == "implementer"
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status in {"ready", "todo"}
+        assert task.last_failure_error == stale
+        latest = conn.execute(
+            "SELECT outcome FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL "
+            "ORDER BY ended_at DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert latest["outcome"] == "changes_requested"
+
+        # 复核打回＝复核 run 成功收尾 → 旧限流文本不参与 blocker_auth。
+        assert kbd.check_respawn_guard(conn, tid, lane="ready") is None
+
+
+@pytest.mark.parametrize(
+    "outcome, error_text, run_age, expected",
+    [
+        # 最新 run 就是失败类：真正的 auth / quota 阻塞照旧挡（语义不变）。
+        ("spawn_failed", "spawn failed: 429 quota exhausted", 10, "blocker_auth"),
+        ("blocked", "authentication error: 401 unauthorized", 10, "blocker_auth"),
+        # crashed：日志里的 auth 字样是上下文、不是诊断（#117097，语义不变）。
+        ("crashed", "last captured output: claude auth status", 10, None),
+        # 复核打回：复核 run 成功收尾，旧文本属更早尝试（本卡修复点）。
+        (
+            "changes_requested",
+            "pid 24320 exited rate-limited (quota wall) — requeued",
+            10,
+            None,
+        ),
+        # rate_limited 冷却语义不变：冷却窗内照旧返回 rate_limit_cooldown。
+        (
+            "rate_limited",
+            "pid 24320 exited rate-limited (quota wall) — requeued",
+            10,
+            "rate_limit_cooldown",
+        ),
+        # 无 run：既有 fail-closed 口径不变。
+        (None, "billing 402 subscription required", None, "blocker_auth"),
+    ],
+)
+def test_respawn_guard_ready_lane_matrix_unchanged_except_changes_requested(
+    kanban_home, monkeypatch, outcome, error_text, run_age, expected,
+):
+    """ready 道回归矩阵：只有 ``changes_requested`` 由挡改为放行，其余逐条不变。"""
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = int(time.time())
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title=f"ready outcome={outcome}", assignee="a")
+        if run_age is not None:
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None
+            conn.execute(
+                "UPDATE task_runs SET outcome=?, status=?, ended_at=? WHERE id=?",
+                (outcome, outcome, now - run_age, claimed.current_run_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='ready', current_run_id=NULL, "
+                "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+                "worker_started_at=NULL WHERE id=?",
+                (tid,),
+            )
+        conn.execute(
+            "UPDATE tasks SET last_failure_error=? WHERE id=?", (error_text, tid),
+        )
+        conn.commit()
+        assert kbd.check_respawn_guard(conn, tid, lane="ready") == expected
+
+
 @pytest.mark.parametrize(
     "error_text, expected",
     [

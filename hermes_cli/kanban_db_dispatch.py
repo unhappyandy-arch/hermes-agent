@@ -85,13 +85,19 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
 )
 
 # Run outcomes that prove the latest attempt SUCCEEDED — the card moved on.
-# ``last_failure_error`` is only ever stamped by a failed attempt and
-# ``request_review`` deliberately preserves it (the failure streak is reset by
-# ``complete_task`` alone), so after a recovered attempt its text is stale
-# history, not this run's blocker (#119070: a rate-limited requeue followed by a
-# successful review handoff was parked as ``blocker_auth`` forever). No run at
-# all (``latest_outcome is None``) keeps the old fail-closed behaviour.
-_RESPAWN_SUCCESS_OUTCOMES = frozenset({"completed", "review_requested"})
+# ``last_failure_error`` is only ever stamped by a failed attempt and both
+# ``request_review`` and ``request_changes`` deliberately preserve it (the
+# failure streak is reset by ``complete_task`` alone), so after a recovered or
+# review-closed attempt its text is stale history, not this run's blocker.
+# ``review_requested``: #119070 — a rate-limited requeue followed by a
+# successful review handoff was parked as ``blocker_auth`` forever.
+# ``changes_requested``: same family on the ready lane — the reviewer run
+# itself finished fine, and ``request_changes`` hands the card back with the
+# old text still stamped, so the implementer could never be respawned.
+# No run at all (``latest_outcome is None``) keeps the old fail-closed behaviour.
+_RESPAWN_SUCCESS_OUTCOMES = frozenset(
+    {"completed", "review_requested", "changes_requested"}
+)
 
 
 @dataclass
@@ -1629,9 +1635,11 @@ def check_respawn_guard(
     # captured output, which is context rather than a diagnosis and may contain
     # benign commands such as ``claude auth status`` (#117097).  A SUCCESSFUL
     # latest run is different again: the text then belongs to an earlier
-    # attempt (``request_review`` keeps ``last_failure_error`` by design), so it
-    # must not park a review handoff that followed a recovered rate-limit
-    # (#119070). Latest run only — no run keeps the fail-closed reading.
+    # attempt (``request_review`` / ``request_changes`` keep
+    # ``last_failure_error`` by design), so it must not park a review handoff
+    # that followed a recovered rate-limit (#119070) nor a card handed back by
+    # ``request_changes`` (ready lane, same family). Latest run only — no run
+    # keeps the fail-closed reading.
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
     if (err

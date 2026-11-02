@@ -876,6 +876,22 @@ _STATUS_TO_FAILOVER_REASON = {
 _USAGE_LIMIT_REASON_TOKENS = ("usage_limit_reached", "gousagelimit")
 _USAGE_LIMIT_MESSAGE_TOKENS = ("usage limit reached", "usage limit has been reached")
 
+# 429「额度墙」词表（小写子串）：周期额度用尽，用同一把 key 再撞一次没有信息增益。
+# 方舟（火山 ark）周墙的 body 形如 {"code": "AccountQuotaExceeded", "type": "TooManyRequests",
+# "message": "You have exceeded the weekly usage quota. It will reset at …"}。
+_QUOTA_WALL_429_MARKERS = (
+    "accountquotaexceeded", "quota", "usage limit", "usage_limit_reached", "usage_limit_exceeded",
+    "exceeded the weekly", "exceeded the monthly", "weekly usage", "monthly usage",
+    "allowance", "plan limit", "额度",
+)
+# 突发限流词表：同一把 key 重试有意义，首败即轮换会把多 key 池快速打空，必须保持原「先重试」语义。
+# 命中任一即判否（额度词表不得压过它）。
+_BURST_THROTTLE_429_MARKERS = (
+    "burst", "too many requests", "requests per minute", "tokens per minute",
+    "rate increased too quickly", "too many concurrent", "throttling",
+    "请求过于频繁", "限流",
+)
+
 
 def _failed_credential_identity(agent, pool) -> tuple[Optional[str], Optional[str]]:
     """``(api_key_hint, credential_id)`` of the key actually dispatched, not ``pool.current()``:
@@ -938,6 +954,37 @@ def _recover_auth_failure(agent, pool, **kwargs):
     return recover_auth_failure(agent, pool, **kwargs)
 
 
+def _is_quota_wall_429(error_context) -> bool:
+    """429 是否属于「额度墙」（周期额度用尽），而非突发限流。
+
+    只有额度墙值得首败即轮换：同一把已撞墙的 key 再试一次仍是 429，没有信息增益，
+    而池里下一把可能健康。突发限流（``RequestBurstTooFast`` / ``rate increased too
+    quickly`` 等）重试同一把 key 有意义，命中突发词表一律判否，避免把池快速打空。
+    """
+    if not isinstance(error_context, dict):
+        return False
+    haystack = " ".join(
+        str(error_context.get(key) or "") for key in ("reason", "code", "error", "message")
+    ).lower()
+    if not haystack:
+        return False
+    if any(marker in haystack for marker in _BURST_THROTTLE_429_MARKERS):
+        return False
+    return any(marker in haystack for marker in _QUOTA_WALL_429_MARKERS)
+
+
+def _pool_has_alternate(pool) -> bool:
+    """池里是否还有别的条目可换：``entries()>1`` 且 ``has_available()``。
+
+    探测失败一律判否（fail closed）——退回「先重试」的旧语义好过误判后把池轮空。
+    """
+    try:
+        return len(pool.entries()) > 1 and bool(pool.has_available())
+    except Exception:
+        logger.debug("Credential pool availability probe failed; keeping retry-first semantics", exc_info=True)
+        return False
+
+
 def _recover_rate_limit(pool, *, has_retried_429, error_context, api_key_hint, credential_id, rotate_and_swap):
     # Already-exhausted credential: rotate immediately. Avoids the "cancel-between-429s" trap where
     # the local has_retried_429 resets per prompt and retries forever.
@@ -965,6 +1012,16 @@ def _recover_rate_limit(pool, *, has_retried_429, error_context, api_key_hint, c
             t in context_message for t in _USAGE_LIMIT_MESSAGE_TOKENS
         )
     if not has_retried_429 and not usage_limit_reached:
+        # 多凭据池上的额度墙：同一把已撞墙的 key 再重试一次没有信息增益（方舟周墙实测：
+        # 首败重试 2–3 秒后仍然是 429），池里下一把可能健康，所以首败即轮换。
+        # 单 key 池、无可用条目、突发限流一律保持原有「先重试」语义。
+        if _is_quota_wall_429(error_context) and _pool_has_alternate(pool):
+            _ra().logger.info(
+                "Credential %s — quota-wall 429 on a multi-entry pool with available entries; "
+                "rotating on first failure instead of retrying the same key",
+                credential_id or api_key_hint or "?",
+            )
+            return (True, False) if rotate_and_swap(429, "rate limit, quota wall pre-rotate") else (False, True)
         return False, True
     return (True, False) if rotate_and_swap(429, "rate limit") else (False, True)
 
@@ -975,9 +1032,13 @@ def recover_with_credential_pool(
     error_context: Optional[dict[str, Any]] = None, billing_unverified: bool = False,
 ) -> tuple[bool, bool]:
     """Attempt credential recovery via pool rotation; returns (recovered, has_retried_429).
-    Rate limits: retry once, then rotate. Billing: rotate immediately. Auth: refresh before
-    rotating. ``classified_reason`` beats raw HTTP codes (e.g. Anthropic 400 "out of extra
-    usage"); ``billing_unverified`` gives the entry a short cooldown, not the one-hour bench."""
+
+    Rate limits: retry once, then rotate — except a quota-wall 429 on a multi-entry pool with
+    available entries, which rotates on the first failure (retrying a walled key is a wasted
+    request; burst throttling keeps the retry-first ladder). Billing: rotate immediately. Auth:
+    refresh before rotating. ``classified_reason`` beats raw HTTP codes (e.g. Anthropic 400
+    "out of extra usage"); ``billing_unverified`` gives the entry a short cooldown, not the
+    one-hour bench."""
     pool = agent._credential_pool
     if pool is None:
         return False, has_retried_429

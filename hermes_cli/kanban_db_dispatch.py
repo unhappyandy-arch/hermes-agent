@@ -84,6 +84,15 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Run outcomes that prove the latest attempt SUCCEEDED — the card moved on.
+# ``last_failure_error`` is only ever stamped by a failed attempt and
+# ``request_review`` deliberately preserves it (the failure streak is reset by
+# ``complete_task`` alone), so after a recovered attempt its text is stale
+# history, not this run's blocker (#119070: a rate-limited requeue followed by a
+# successful review handoff was parked as ``blocker_auth`` forever). No run at
+# all (``latest_outcome is None``) keeps the old fail-closed behaviour.
+_RESPAWN_SUCCESS_OUTCOMES = frozenset({"completed", "review_requested"})
+
 
 @dataclass
 class DispatchResult:
@@ -1565,7 +1574,9 @@ def check_respawn_guard(
     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
     ``last_failure_error`` that would otherwise park the task forever — that
     path never increments ``consecutive_failures``), ``"blocker_auth"``
-    (quota/auth pattern; the breaker still trips eventually), then for the
+    (quota/auth pattern in ``last_failure_error``; the breaker still trips
+    eventually — skipped when the latest run is a success terminal, whose stamp
+    is stale history from an earlier attempt, #119070), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
@@ -1616,10 +1627,17 @@ def check_respawn_guard(
     # 2. Quota / auth blocker: retrying immediately will not help.  A plain
     # crash is different: its persisted error includes the worker's last
     # captured output, which is context rather than a diagnosis and may contain
-    # benign commands such as ``claude auth status`` (#117097).
+    # benign commands such as ``claude auth status`` (#117097).  A SUCCESSFUL
+    # latest run is different again: the text then belongs to an earlier
+    # attempt (``request_review`` keeps ``last_failure_error`` by design), so it
+    # must not park a review handoff that followed a recovered rate-limit
+    # (#119070). Latest run only — no run keeps the fail-closed reading.
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
+    if (err
+            and latest_outcome not in _RESPAWN_SUCCESS_OUTCOMES
+            and latest_outcome != "crashed"
+            and _RESPAWN_BLOCKER_RE.search(err)):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL

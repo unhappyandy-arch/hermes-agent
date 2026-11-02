@@ -469,6 +469,102 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kbd.check_respawn_guard(conn, tid) is None
 
 
+def test_respawn_guard_review_lane_ignores_stale_rate_limit_stamp(
+    kanban_home, monkeypatch,
+):
+    """#119070：限流后重排、下一条 run 成功转复核的卡，不得被旧限流文本挡死。
+
+    真实序列（本机 t_8cf40707 实证）：run N 被 crash sweep 判 ``rate_limited``
+    （stamp ``last_failure_error = "… rate-limited (quota wall) …"``）→ 同 tick
+    重排 → run N+1 成功 ``kanban_request_review``。``request_review`` 按设计
+    保留 ``last_failure_error``（失败连击账只由 ``complete_task`` 清零），于是
+    ``check_respawn_guard(lane="review")`` 把旧文本读成「本次」额度阻塞，返回
+    ``blocker_auth``，复核道永远派不出 worker，网关每 5 分钟刷一条 stuck 告警。
+    """
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = int(time.time())
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="review after rate limit", assignee="dev")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        # run 1：被限流的那次尝试（已由 crash sweep 收尾）。
+        conn.execute(
+            "UPDATE task_runs SET outcome='rate_limited', status='rate_limited', "
+            "ended_at=? WHERE id=?",
+            (now - 60, claimed.current_run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, worker_started_at=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("pid 1 exited rate-limited (quota wall) — requeued without counting a failure", tid),
+        )
+        conn.commit()
+
+        # run 2：重排后的尝试成功转复核。
+        claimed2 = kb.claim_task(conn, tid)
+        assert claimed2 is not None
+        assert kb.request_review(
+            conn, tid, summary="implementation ready for review",
+            expected_run_id=claimed2.current_run_id,
+        )
+        assert kb.get_task(conn, tid).status == "review"
+        latest = conn.execute(
+            "SELECT outcome FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL "
+            "ORDER BY ended_at DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert latest["outcome"] == "review_requested"
+        # 缺陷前提：旧限流文本确实还在库里。
+        assert "rate-limited" in (kb.get_task(conn, tid).last_failure_error or "")
+
+        # 成功终态不参与 blocker_auth 判断 → 复核道放行。
+        assert kbd.check_respawn_guard(conn, tid, lane="review") is None
+
+
+@pytest.mark.parametrize(
+    "outcome, error_text, expected",
+    [
+        # 真正的 auth / quota 失败：最新 run 就是失败类 → 仍挡（既有语义不变）。
+        ("spawn_failed", "spawn failed: 429 quota exhausted", "blocker_auth"),
+        ("blocked", "authentication error: 401 unauthorized", "blocker_auth"),
+        # 失败类但 crashed：崩溃日志里的 auth 字样是上下文、不是诊断（既有语义）。
+        ("crashed", "last captured output: claude auth status", None),
+        # 成功终态：更早尝试留下的文本属陈旧历史，不参与判断（本卡修复点）。
+        ("review_requested", "pid 1 exited rate-limited (quota wall) — requeued", None),
+        ("completed", "billing 402 subscription required", None),
+    ],
+)
+def test_respawn_guard_blocker_auth_only_for_unsuccessful_latest_runs(
+    kanban_home, monkeypatch, outcome, error_text, expected,
+):
+    """``last_failure_error`` 只说明「上一次尝试怎么死的」，不说明「最新一次」。
+
+    最新 run 是成功终态（``completed`` / ``review_requested``）时，该文本必然是
+    更早尝试的残留，不得再触发 ``blocker_auth``；最新 run 仍是失败类时保持原样。
+    用复核道（``lane="review"``）隔离 ``blocker_auth`` 判据：ready 道的
+    ``recent_success`` / ``active_pr`` 是另一层守卫，不属本用例。
+    """
+    now = int(time.time())
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title=f"outcome={outcome}", assignee="a")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        conn.execute(
+            "UPDATE task_runs SET outcome=?, status=?, ended_at=? WHERE id=?",
+            (outcome, outcome, now - 10, claimed.current_run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, worker_started_at=NULL, "
+            "last_failure_error=? WHERE id=?",
+            (error_text, tid),
+        )
+        conn.commit()
+        assert kbd.check_respawn_guard(conn, tid, lane="review") == expected
+
+
 @pytest.mark.parametrize(
     "error_text, expected",
     [

@@ -1,0 +1,376 @@
+diff --git a/gateway/run.py b/gateway/run.py
+index 2db32d7fea6..fa7ee3c7920 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -427,12 +427,27 @@ def _ensure_windows_gateway_venv_imports() -> None:
+         return
+ 
+     project_root = Path(__file__).resolve().parent.parent
+-    from pm.environments import committed_venv, venv_python_version
++    from pm.environments import committed_venv, venv_abi_problem, venv_python_version
++
++    # C1 启动诊断（修方案 v2）：一行看清解释器 ABI 与导入路径，供下次事故取证。
++    logger.debug(
++        "gateway venv import env: python=%s abi=%s sys.path=%s",
++        sys.version.split()[0], sys.implementation.cache_tag, os.pathsep.join(sys.path),
++    )
+ 
+     # A PM install's store Python was already activated onto the committed generation by
+     # hermes_bootstrap; overlaying the leftover pre-PM venv loads a foreign ABI (#122183).
+     if committed_venv(project_root) is not None:
+         return
++    # PM 断档：记录里没有 committed 环境，只能走 legacy fallback。修方案 v2 B1 闸门
++    # （hosted_room_worker / pydantic_core 事故）：fallback 只垫「本解释器生成」的
++    # venv；错 ABI 的候选整条跳过，宁可 ImportError 显式报错，也不把 cp311 残包
++    # 垫进 3.14 网关（#122183 同类：compiled modules vanish / import 即烂）。
++    logger.warning(
++        "PM dependency environment not recorded for %s; legacy venv overlay is ABI-gated "
++        "(run `hermes pm install --repair` to restore the committed environment)",
++        project_root,
++    )
+     candidates = [Path(v) for v in (os.environ.get("VIRTUAL_ENV"),) if v] + [project_root / "venv"]
+ 
+     seen: set[str] = set()
+@@ -449,6 +464,11 @@ def _ensure_windows_gateway_venv_imports() -> None:
+         site_packages = resolved_venv / "Lib" / "site-packages"
+         if not site_packages.exists():
+             continue
++        # B1 闸门：venv 非本解释器生成 → 不垫包（见上方注释）。
++        problem = venv_abi_problem(resolved_venv)
++        if problem:
++            logger.warning("skipping legacy venv overlay %s: %s", resolved_venv, problem)
++            continue
+         # Built for another (or an unreadable) Python: its compiled modules crash this one (#139085).
+         if (found := venv_python_version(resolved_venv)) != sys.version_info[:2]:
+             logger.debug("Skipping venv overlay %s: Python %s, gateway %s", resolved_venv, found or "unknown", sys.version_info[:2])
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index e1c36a81119..622d3f91118 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -605,6 +605,41 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
+                       f"Reclaimed {args.task_id}")
+ 
+ 
++def _cmd_state(args: argparse.Namespace) -> int:
++    """断点续跑层（``task_run_state``）：读断点 / 推进游标 / 清档。
++
++    不带参数＝列出该任务全部断点；``--key`` 只读写/只清指定 key；``--value`` 写入
++    （推进游标）；``--clear`` 清档（真正跑完才清，回收不该清）。
++    """
++    task_id = args.task_id
++    keys = list(getattr(args, "key", None) or [])
++    value = getattr(args, "value", None)
++    with kbc.connect_closing() as conn:
++        if getattr(args, "clear", False):
++            removed = kb.run_state_clear(conn, task_id, keys=keys or None)
++            scope = f"key(s) {', '.join(keys)}" if keys else "all keys"
++            print(f"Cleared {removed} checkpoint(s) for {task_id} ({scope})")
++            return 0
++        if value is not None:
++            if not keys:
++                return _err("kanban: --value 需要配 --key（写哪个断点）", 2)
++            for key in keys:
++                kb.run_state_set(conn, task_id, key, value)
++            print(f"Set {task_id} {', '.join(keys)} = {value}")
++            return 0
++        state = kb.run_state_list(conn, task_id)
++        if keys:
++            for key in keys:
++                print(f"{key} = {state.get(key, '(unset)')}")
++            return 0
++        if not state:
++            print(f"(no checkpoints) {task_id}")
++            return 0
++        for key in sorted(state):
++            print(f"{key} = {state[key]}")
++        return 0
++
++
+ def _cmd_reassign(args: argparse.Namespace) -> int:
+     profile = _none_profile(args.profile)
+     reclaim = bool(getattr(args, "reclaim", False))
+@@ -1321,7 +1356,7 @@ _HANDLERS = {
+     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
+     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
+     "assign": _cmd_assign, "set-model": _cmd_set_model,
+-    "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
++    "reclaim": _cmd_reclaim, "reassign": _cmd_reassign, "state": _cmd_state,
+     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
+     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
+     "comment": _cmd_comment, "attach": _cmd_attach,
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 4279503ff55..1254a0b7c2f 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2428,6 +2428,86 @@ def release_stale_claims(
+     return reclaimed
+ 
+ 
++# --- 断点续跑层：task_run_state（ZZR patch，t_a1e6a80c 第 7 项）-------------
++#
++# 回收（自动 stale sweep + 手动 ``hermes kanban reclaim``）会换一个新 run；断点必须
++# 跟着任务走，所以本表按 ``task_id`` 键控、不按 run_id。缺表时读操作一律降级为
++# 「没有断点」（None / {}），老库不必先迁移也能安全跑 worker。
++
++_RUN_STATE_DDL = """
++CREATE TABLE IF NOT EXISTS task_run_state (
++    task_id    TEXT NOT NULL,
++    key        TEXT NOT NULL,
++    value      TEXT,
++    updated_at INTEGER NOT NULL,
++    PRIMARY KEY (task_id, key)
++)
++"""
++
++
++def _run_state_table_missing(exc: sqlite3.OperationalError) -> bool:
++    return "no such table" in str(exc).lower()
++
++
++def run_state_get(conn: sqlite3.Connection, task_id: str, key: str) -> Optional[str]:
++    """读一个断点值；缺表或没有该 key 一律 ``None``（只读安全）。"""
++    try:
++        row = conn.execute(
++            "SELECT value FROM task_run_state WHERE task_id = ? AND key = ?", (task_id, key),
++        ).fetchone()
++    except sqlite3.OperationalError as exc:
++        if _run_state_table_missing(exc):
++            return None
++        raise
++    return None if row is None else row[0]
++
++
++def run_state_list(conn: sqlite3.Connection, task_id: str) -> dict[str, str]:
++    """列出一个任务的全部断点 ``{key: value}``；缺表返回 ``{}``。"""
++    try:
++        rows = conn.execute(
++            "SELECT key, value FROM task_run_state WHERE task_id = ? ORDER BY key", (task_id,),
++        ).fetchall()
++    except sqlite3.OperationalError as exc:
++        if _run_state_table_missing(exc):
++            return {}
++        raise
++    return {r[0]: r[1] for r in rows}
++
++
++def run_state_set(conn: sqlite3.Connection, task_id: str, key: str, value: str) -> None:
++    """写/覆盖一个断点（推进游标即存）；首次写入时懒建表。"""
++    with write_txn(conn):
++        conn.execute(_RUN_STATE_DDL)
++        conn.execute(
++            "INSERT OR REPLACE INTO task_run_state (task_id, key, value, updated_at) "
++            "VALUES (?, ?, ?, ?)",
++            (task_id, key, value, int(time.time())),
++        )
++
++
++def run_state_clear(
++    conn: sqlite3.Connection, task_id: str, keys: Optional[Iterable[str]] = None,
++) -> int:
++    """清档：给 ``keys`` 只清这些 key，否则清该任务全部断点；返回删除行数。"""
++    wanted = list(keys or [])
++    try:
++        with write_txn(conn):
++            if wanted:
++                placeholders = ", ".join(["?"] * len(wanted))
++                cur = conn.execute(
++                    f"DELETE FROM task_run_state WHERE task_id = ? AND key IN ({placeholders})",
++                    (task_id, *wanted),
++                )
++            else:
++                cur = conn.execute("DELETE FROM task_run_state WHERE task_id = ?", (task_id,))
++            return cur.rowcount
++    except sqlite3.OperationalError as exc:
++        if _run_state_table_missing(exc):
++            return 0
++        raise
++
++
+ def _record_reclaim(
+     conn: sqlite3.Connection, task_id: str, termination: dict, *, error: str, payload: dict,
+ ) -> Optional[int]:
+@@ -2437,6 +2517,11 @@ def _record_reclaim(
+         conn, task_id, outcome="reclaimed", status="reclaimed", error=error, metadata=termination,
+     )
+     payload.update(termination)
++    # ZZR patch：把当前断点 key 挂进 reclaimed 事件——自动 stale sweep 与手动
++    # reclaim 都过这里，回收后一眼看出新 run 该从哪儿续跑。
++    resume_keys = sorted(run_state_list(conn, task_id))
++    if resume_keys:
++        payload["resume_state_keys"] = resume_keys
+     _append_event(conn, task_id, "reclaimed", payload, run_id=run_id)
+     return run_id
+ 
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 8a65d413467..b4215e6e969 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -258,6 +258,15 @@ _SPECS = [
+                   "--provider <name>). Cleared together with the model."),
+     ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
+     _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
++    _cmd("state", [
++        _TASK_ID,
++        _arg("--key", action="append", metavar="KEY",
++             help="Checkpoint key to read/clear (repeatable); omit to list every key"),
++        _arg("--value", metavar="VALUE",
++             help="Store VALUE under --key (advance the cursor as work progresses)"),
++        _arg("--clear", action="store_true",
++             help="Drop the checkpoint(s): with --key only those keys, bare --clear wipes the task"),
++    ], help="Read, advance or clear a task's resumable checkpoint (survives a reclaim)"),
+     _cmd("reassign", [
+         _TASK_ID,
+         _arg("profile", help="New profile name (or 'none' to unassign)"),
+diff --git a/hermes_cli/web_server_dashboard.py b/hermes_cli/web_server_dashboard.py
+index 450198c27f9..498533a180f 100644
+--- a/hermes_cli/web_server_dashboard.py
++++ b/hermes_cli/web_server_dashboard.py
+@@ -12,7 +12,7 @@ import time
+ from contextlib import contextmanager
+ import hermes_yaml as yaml
+ from fastapi import Depends, FastAPI, HTTPException, Request, WebSocketException
+-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
++from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
+ from fastapi.staticfiles import StaticFiles
+ from starlette import status
+ from starlette._utils import get_route_path
+@@ -231,6 +231,14 @@ def mount_spa(application: FastAPI):
+         "/assets", _ImmutableAssetFiles(directory=WEB_DIST / "assets", check_dir=False), name="assets"
+     )
+ 
++    # ZZR patch（2026-10-05，老板令）：值班表页固定路由 —— /watch 与 /watch/ 一律跳 /watch.html。
++    # 必须注册在 serve_spa 兜底路由之前：兜底是 /{full_path:path}，会把无扩展名的
++    # /watch 当 SPA 前端路由返回 index.html（看板主面板），老板看到的就是「打不开」。
++    @application.get("/watch")
++    @application.get("/watch/")
++    async def watch_alias():
++        return RedirectResponse("/watch.html", status_code=302)
++
+     @application.get("/{full_path:path}")
+     async def serve_spa(full_path: str, request: Request):
+         prefix = _normalise_prefix(request.headers.get("x-forwarded-prefix"))
+diff --git a/pm/environments.py b/pm/environments.py
+index 231ae77c1b7..8a330e9ebac 100644
+--- a/pm/environments.py
++++ b/pm/environments.py
+@@ -12,6 +12,7 @@ import json
+ import os
+ import re
+ import shlex
++import sys
+ from pathlib import Path
+ 
+ from hermes_constants import get_default_hermes_root, project_venv_dir
+@@ -294,6 +295,54 @@ def committed_venv(project_root: Path) -> Path | None:
+     return _recorded_venv(project_root) or payload_venv(project_root)
+ 
+ 
++def venv_abi_problem(venv_root: Path) -> str | None:
++    """None when ``venv_root`` was built for the running interpreter, else why not.
++
++    ZZR-82ce8ab1 修方案_hosted_room_worker_pydantic_core_v2 B1/B2 的 ABI 闸门
++    核心：venv 元数据登记（pm.install._commit_selection）只接受「本解释器生成」
++    的环境——pyvenv.cfg 的 Python 版本与现解释器 major.minor 一致，且二进制扩展
++    （*.pyd）的 cp 标签等于 sys.implementation.cache_tag；pydantic_core/ 下须存在
++    匹配 cache_tag 的 pyd。任一不满足按「环境损坏」处理：拒绝登记（B2）/不垫包
++    （B1），宁可 ImportError 显式报错，也不让错 ABI 的包混进 committed 记录。
++    """
++    current = f"{sys.version_info.major}.{sys.version_info.minor}"
++    cache_tag = (sys.implementation.cache_tag or "").lower()
++    # pyd 文件名用短 ABI 标签（cp314），cache_tag 是长标签（cpython-314），须归一化后比。
++    abi_short = cache_tag.replace("cpython-", "cp")
++    root = Path(venv_root)
++    cfg = root / "pyvenv.cfg"
++    if not cfg.is_file():
++        return f"环境损坏: pyvenv.cfg 缺失 ({cfg})"
++    version = None
++    for line in cfg.read_text(encoding="utf-8", errors="replace").splitlines():
++        key, _, value = line.partition("=")
++        if key.strip() in ("version", "version_info") and value.strip():
++            version = value.strip()
++            break
++    if version is None:
++        return f"环境损坏: pyvenv.cfg 无版本信息 ({cfg})"
++    if ".".join(version.split(".")[:2]) != current:
++        return f"环境损坏: venv Python {version} ≠ 现解释器 {current} ({sys.executable})"
++    site = site_packages(root)
++    if not site.is_dir():
++        return f"环境损坏: site-packages 缺失 ({site})"
++    matched_pydd = False
++    for pyd in site.rglob("*.pyd"):
++        match = re.search(r"\.(cp\d+[a-z]*)-[^.]*\.pyd$", pyd.name, re.IGNORECASE)
++        tag = match.group(1).lower() if match else ""
++        if tag and abi_short and tag != abi_short:
++            return (
++                f"环境损坏: 二进制扩展非本解释器生成: {pyd.name} "
++                f"(cp={tag}, 本解释器={cache_tag})"
++            )
++        if pyd.parent.name.lower() == "pydantic_core" and tag == abi_short:
++            matched_pydd = True
++    pc_dir = site / "pydantic_core"
++    if pc_dir.is_dir() and not matched_pydd:
++        return f"环境损坏: pydantic_core 下无匹配 {cache_tag} 的 pyd ({pc_dir})"
++    return None
++
++
+ def _recorded_venv(project_root: Path) -> Path | None:
+     path = runtime_facts_path(project_root)
+     try:
+diff --git a/pm/install.py b/pm/install.py
+index c32b5ccd92c..e8ec7d32a8a 100644
+--- a/pm/install.py
++++ b/pm/install.py
+@@ -7,6 +7,7 @@ import json
+ import logging
+ import os
+ import shutil
++import sys
+ import threading
+ from contextlib import ExitStack, contextmanager, nullcontext
+ from dataclasses import dataclass
+@@ -776,8 +777,20 @@ def _commit_selection(package, facts: Facts, change, *, enabled: list[str], stam
+         if change is not None:
+             change.publish(paths.repo_root())
+         if not current:
+-            if result.get("environment") is not None:
+-                from pm.environments import flush_before_selecting
++            environment = result.get("environment")
++            if environment is not None:
++                from pm.environments import flush_before_selecting, venv_abi_problem
++                # 修方案 v2 B2 闸门：错 ABI 的生成环境拒绝登记，宁可报错也不让
++                # committed 记录指向一个导入即烂的 venv（hosted_room_worker 根因）。
++                problem = venv_abi_problem(Path(environment))
++                if problem:
++                    raise InstallError(
++                        "venv",
++                        problem,
++                        "拒绝登记错 ABI 的依赖环境；请用本解释器重建（`hermes pm install --repair`），勿手动挪用旧 venv",
++                    )
++                result.setdefault("python", ".".join(str(p) for p in sys.version_info[:3]))
++                result.setdefault("abi_tag", sys.implementation.cache_tag or "")
+                 flush_before_selecting()
+             facts.record_state("venv", stamp, enabled, **result)
+         if change is not None:
+diff --git a/pm/lock.py b/pm/lock.py
+index 4dce1e5f82d..31aeb275bab 100644
+--- a/pm/lock.py
++++ b/pm/lock.py
+@@ -269,6 +269,7 @@ class Facts:
+     def record_state(
+         self, name: str, stamp: str, extras: list[str], *,
+         environment: Path | None = None, resolved_lock: Path | None = None,
++        python: str | None = None, abi_tag: str | None = None,
+     ) -> None:
+         """Commit a verified state package and its selected environment atomically."""
+         fact = {"stamp": stamp, "extras": extras}
+@@ -276,6 +277,10 @@ class Facts:
+             fact["environment"] = str(environment.resolve())
+         if resolved_lock is not None:
+             fact["resolved_lock"] = str(resolved_lock.resolve())
++        if python is not None:
++            fact["python"] = python
++        if abi_tag is not None:
++            fact["abi_tag"] = abi_tag
+         self._merge_and_write(name, fact)
+ 
+     def retain(self, names: set[str]) -> None:

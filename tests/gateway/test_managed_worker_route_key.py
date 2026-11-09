@@ -3,6 +3,7 @@ way the in-process runner does (``_resolve_policy_agent_runtime``), so an ``anth
 provider other than Anthropic gets its own key instead of ``Bearer `` (#139155). The key comes from
 the worker's own profile home, never the default one, and a bound launch key still wins."""
 import json
+import logging
 import secrets
 import threading
 from types import SimpleNamespace
@@ -313,3 +314,88 @@ def test_keyless_worker_on_a_fallback_never_sends_its_key_to_the_primary_endpoin
     assert primary and fallback_key not in primary
     assert all(fallback_key != key for key, _ in clients)
     assert built['api_key'] is None
+
+
+QUOTA_URL = 'https://quota-lab.example/v1'
+
+
+def _quota_pool_frame(tmp_path, monkeypatch, api_key=None):
+    """A key-less worker frame whose ``custom:quota-lab`` route is served by the profile's two-entry
+    auth-store pool: the shape a quota-limited custom endpoint has."""
+    from agent.credential_pool import custom_provider_pool_key_candidates
+    from hermes_constants import get_hermes_home
+    frame, _ = assignment(tmp_path, monkeypatch)
+    config = json.loads(frame['policy']['config_json'])
+    config['model'] = {'default': 'quota-lab-1', 'provider': 'custom:quota-lab', 'base_url': QUOTA_URL,
+                       'api_mode': 'chat_completions'}
+    config['custom_providers'] = [{'name': 'quota-lab', 'base_url': QUOTA_URL, 'api_mode': 'chat_completions'}]
+    request = {**json.loads(frame['policy']['request_json']), 'base_url': QUOTA_URL}
+    request.pop('provider', None)
+    policy = {**frame['policy'], 'model': 'quota-lab-1', 'config_json': json.dumps(config),
+              'request_json': json.dumps(request)}
+    pool_key = custom_provider_pool_key_candidates(QUOTA_URL, 'quota-lab', config=config)[0]
+    home = get_hermes_home()
+    home.mkdir(parents=True, exist_ok=True)
+    # The live config holds the same entry the frozen snapshot does: ``_finalize_routing`` accepts a
+    # named custom pool only for an endpoint the profile configures (the production shape).
+    (home / 'config.yaml').write_text(json.dumps({'model': config['model'],
+                                                  'custom_providers': config['custom_providers']}))
+    tokens = ['fake-quota-' + secrets.token_hex(8), 'fake-quota-' + secrets.token_hex(8)]
+    (home / 'auth.json').write_text(json.dumps({'version': 1, 'providers': {}, 'credential_pool': {pool_key: [
+        {'id': 'g1', 'label': 'g1', 'auth_type': 'api_key', 'priority': 0, 'source': 'manual',
+         'access_token': tokens[0]},
+        {'id': 'g2', 'label': 'g2', 'auth_type': 'api_key', 'priority': 1, 'source': 'manual',
+         'access_token': tokens[1]}]}}))
+    return {**frame, 'policy': policy, 'api_key': api_key}
+
+
+def _quota_pool_agent(tmp_path, monkeypatch, *, run=None, sent=None):
+    """The worker's own construction path, holding the real ``AIAgent``: the agent a Kanban run gets
+    and the turn it would drive (``run`` replaces the turn body; the default one answers at once)."""
+    from run_agent import AIAgent
+    made, turns = [], []
+
+    class Recorded(AIAgent):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            made.append(self)
+            if run is not None:
+                # ``_execute``'s proxy answers every turn itself; this replaces that turn body so the
+                # 429 is driven inside the worker's own run.
+                self.run_conversation = lambda *args, **kwargs: run(self, turns)
+
+    _execute(_quota_pool_frame(tmp_path, monkeypatch), monkeypatch, base=Recorded, sent=sent)
+    assert made, 'the worker never constructed an agent'
+    return made[0], turns
+
+
+def test_keyless_worker_hands_its_routes_credential_pool_to_the_agent(tmp_path, monkeypatch):
+    """The regression: a key-less worker's agent keeps the route's pool. Without it
+    ``recover_with_credential_pool`` returns at once on ``agent._credential_pool is None``, so a
+    quota wall (429) or an expired OAuth token re-sends the same credential until the run fails."""
+    agent, _ = _quota_pool_agent(tmp_path, monkeypatch)
+    assert agent._credential_pool is not None
+    assert [entry.id for entry in agent._credential_pool.entries()] == ['g1', 'g2']
+    assert agent.api_key in {entry.access_token for entry in agent._credential_pool.entries()}
+
+
+def test_a_429_on_a_worker_turn_marks_the_entry_exhausted_and_rotates(tmp_path, monkeypatch, caplog):
+    """The pool the worker hands its agent is the one the turn loop rotates on: a 429 retries the
+    same credential once, then marks it exhausted and swaps in the next entry, and the turn finishes
+    on the rotated credential. Without the pool there is no pool line in the log at all."""
+    from agent.agent_runtime_helpers import recover_with_credential_pool
+
+    def turn(agent, turns):
+        turns.append(recover_with_credential_pool(agent, status_code=429, has_retried_429=False))
+        turns.append(recover_with_credential_pool(agent, status_code=429, has_retried_429=True))
+        return {'final_response': 'ok after rotation', 'completed': True}
+
+    sent = []
+    agent, turns = _quota_pool_agent(tmp_path, monkeypatch, run=turn, sent=sent)
+    caplog.set_level(logging.INFO)
+    assert turns == [(False, True), (True, False)]
+    assert 'credential pool: marking g1 exhausted (status=429), rotating' in caplog.text
+    assert 'rotated to pool entry g2' in caplog.text
+    assert agent.api_key == agent._credential_pool.entries()[1].access_token
+    assert sent[-2][0] == 'result' and sent[-2][1]['result']['final_response'] == 'ok after rotation'
+    assert sent[-1][0] == 'finished'

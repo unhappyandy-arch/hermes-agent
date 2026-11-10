@@ -428,12 +428,27 @@ def _ensure_windows_gateway_venv_imports() -> None:
         return
 
     project_root = Path(__file__).resolve().parent.parent
-    from pm.environments import committed_venv, venv_python_version
+    from pm.environments import committed_venv, venv_abi_problem, venv_python_version
+
+    # C1 启动诊断（修方案 v2）：一行看清解释器 ABI 与导入路径，供下次事故取证。
+    logger.debug(
+        "gateway venv import env: python=%s abi=%s sys.path=%s",
+        sys.version.split()[0], sys.implementation.cache_tag, os.pathsep.join(sys.path),
+    )
 
     # A PM install's store Python was already activated onto the committed generation by
     # hermes_bootstrap; overlaying the leftover pre-PM venv loads a foreign ABI (#122183).
     if committed_venv(project_root) is not None:
         return
+    # PM 断档：记录里没有 committed 环境，只能走 legacy fallback。修方案 v2 B1 闸门
+    # （hosted_room_worker / pydantic_core 事故）：fallback 只垫「本解释器生成」的
+    # venv；错 ABI 的候选整条跳过，宁可 ImportError 显式报错，也不把 cp311 残包
+    # 垫进 3.14 网关（#122183 同类：compiled modules vanish / import 即烂）。
+    logger.warning(
+        "PM dependency environment not recorded for %s; legacy venv overlay is ABI-gated "
+        "(run `hermes pm install --repair` to restore the committed environment)",
+        project_root,
+    )
     candidates = [Path(v) for v in (os.environ.get("VIRTUAL_ENV"),) if v] + [project_root / "venv"]
 
     seen: set[str] = set()
@@ -449,6 +464,11 @@ def _ensure_windows_gateway_venv_imports() -> None:
 
         site_packages = resolved_venv / "Lib" / "site-packages"
         if not site_packages.exists():
+            continue
+        # B1 闸门：venv 非本解释器生成 → 不垫包（见上方注释）。
+        problem = venv_abi_problem(resolved_venv)
+        if problem:
+            logger.warning("skipping legacy venv overlay %s: %s", resolved_venv, problem)
             continue
         # Built for another (or an unreadable) Python: its compiled modules crash this one (#139085).
         if (found := venv_python_version(resolved_venv)) != sys.version_info[:2]:

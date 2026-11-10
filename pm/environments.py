@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shlex
+import sys
 from pathlib import Path
 
 from hermes_constants import get_default_hermes_root, project_venv_dir
@@ -303,6 +304,54 @@ def committed_venv(project_root: Path) -> Path | None:
     site-packages again whenever this install has no dependency facts.
     """
     return _recorded_venv(project_root) or payload_venv(project_root)
+
+
+def venv_abi_problem(venv_root: Path) -> str | None:
+    """None when ``venv_root`` was built for the running interpreter, else why not.
+
+    ZZR-82ce8ab1 修方案_hosted_room_worker_pydantic_core_v2 B1/B2 的 ABI 闸门
+    核心：venv 元数据登记（pm.install._commit_selection）只接受「本解释器生成」
+    的环境——pyvenv.cfg 的 Python 版本与现解释器 major.minor 一致，且二进制扩展
+    （*.pyd）的 cp 标签等于 sys.implementation.cache_tag；pydantic_core/ 下须存在
+    匹配 cache_tag 的 pyd。任一不满足按「环境损坏」处理：拒绝登记（B2）/不垫包
+    （B1），宁可 ImportError 显式报错，也不让错 ABI 的包混进 committed 记录。
+    """
+    current = f"{sys.version_info.major}.{sys.version_info.minor}"
+    cache_tag = (sys.implementation.cache_tag or "").lower()
+    # pyd 文件名用短 ABI 标签（cp314），cache_tag 是长标签（cpython-314），须归一化后比。
+    abi_short = cache_tag.replace("cpython-", "cp")
+    root = Path(venv_root)
+    cfg = root / "pyvenv.cfg"
+    if not cfg.is_file():
+        return f"环境损坏: pyvenv.cfg 缺失 ({cfg})"
+    version = None
+    for line in cfg.read_text(encoding="utf-8", errors="replace").splitlines():
+        key, _, value = line.partition("=")
+        if key.strip() in ("version", "version_info") and value.strip():
+            version = value.strip()
+            break
+    if version is None:
+        return f"环境损坏: pyvenv.cfg 无版本信息 ({cfg})"
+    if ".".join(version.split(".")[:2]) != current:
+        return f"环境损坏: venv Python {version} ≠ 现解释器 {current} ({sys.executable})"
+    site = site_packages(root)
+    if not site.is_dir():
+        return f"环境损坏: site-packages 缺失 ({site})"
+    matched_pydd = False
+    for pyd in site.rglob("*.pyd"):
+        match = re.search(r"\.(cp\d+[a-z]*)-[^.]*\.pyd$", pyd.name, re.IGNORECASE)
+        tag = match.group(1).lower() if match else ""
+        if tag and abi_short and tag != abi_short:
+            return (
+                f"环境损坏: 二进制扩展非本解释器生成: {pyd.name} "
+                f"(cp={tag}, 本解释器={cache_tag})"
+            )
+        if pyd.parent.name.lower() == "pydantic_core" and tag == abi_short:
+            matched_pydd = True
+    pc_dir = site / "pydantic_core"
+    if pc_dir.is_dir() and not matched_pydd:
+        return f"环境损坏: pydantic_core 下无匹配 {cache_tag} 的 pyd ({pc_dir})"
+    return None
 
 
 def _recorded_venv(project_root: Path) -> Path | None:

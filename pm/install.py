@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 import threading
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
@@ -839,8 +840,20 @@ def _commit_selection(package, facts: Facts, change, *, enabled: list[str], stam
         if change is not None:
             change.publish(paths.repo_root())
         if not current:
-            if result.get("environment") is not None:
-                from pm.environments import flush_before_selecting
+            environment = result.get("environment")
+            if environment is not None:
+                from pm.environments import flush_before_selecting, venv_abi_problem
+                # 修方案 v2 B2 闸门：错 ABI 的生成环境拒绝登记，宁可报错也不让
+                # committed 记录指向一个导入即烂的 venv（hosted_room_worker 根因）。
+                problem = venv_abi_problem(Path(environment))
+                if problem:
+                    raise InstallError(
+                        "venv",
+                        problem,
+                        "拒绝登记错 ABI 的依赖环境；请用本解释器重建（`hermes pm install --repair`），勿手动挪用旧 venv",
+                    )
+                result.setdefault("python", ".".join(str(p) for p in sys.version_info[:3]))
+                result.setdefault("abi_tag", sys.implementation.cache_tag or "")
                 flush_before_selecting()
             facts.record_state("venv", stamp, enabled, **result)
         if change is not None:

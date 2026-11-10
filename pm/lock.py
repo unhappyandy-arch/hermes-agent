@@ -269,6 +269,7 @@ class Facts:
     def record_state(
         self, name: str, stamp: str, extras: list[str], *,
         environment: Path | None = None, resolved_lock: Path | None = None,
+        python: str | None = None, abi_tag: str | None = None,
     ) -> None:
         """Commit a verified state package and its selected environment atomically."""
         fact = {"stamp": stamp, "extras": extras}
@@ -276,6 +277,10 @@ class Facts:
             fact["environment"] = str(environment.resolve())
         if resolved_lock is not None:
             fact["resolved_lock"] = str(resolved_lock.resolve())
+        if python is not None:
+            fact["python"] = python
+        if abi_tag is not None:
+            fact["abi_tag"] = abi_tag
         self._merge_and_write(name, fact)
 
     def retain(self, names: set[str]) -> None:

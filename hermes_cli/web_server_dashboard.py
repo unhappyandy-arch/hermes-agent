@@ -10,7 +10,7 @@ import time
 from contextlib import contextmanager
 import hermes_yaml as yaml
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketException
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette import status
 from starlette._utils import get_route_path
@@ -267,6 +267,14 @@ def mount_spa(application: FastAPI):
     from hermes_cli.webapp_previews import mount_preview_assets
     mount_preview_assets(application)
     application.mount("/assets", serve_assets, name="assets")
+
+    # ZZR patch（2026-10-05，老板令）：值班表页固定路由 —— /watch 与 /watch/ 一律跳 /watch.html。
+    # 必须注册在 serve_spa 兜底路由之前：兜底是 /{full_path:path}，会把无扩展名的
+    # /watch 当 SPA 前端路由返回 index.html（看板主面板），老板看到的就是「打不开」。
+    @application.get("/watch")
+    @application.get("/watch/")
+    async def watch_alias():
+        return RedirectResponse("/watch.html", status_code=302)
 
     @application.get("/{full_path:path}")
     async def serve_spa(full_path: str, request: Request):

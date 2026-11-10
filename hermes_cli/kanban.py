@@ -605,6 +605,41 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
                       f"Reclaimed {args.task_id}")
 
 
+def _cmd_state(args: argparse.Namespace) -> int:
+    """断点续跑层（``task_run_state``）：读断点 / 推进游标 / 清档。
+
+    不带参数＝列出该任务全部断点；``--key`` 只读写/只清指定 key；``--value`` 写入
+    （推进游标）；``--clear`` 清档（真正跑完才清，回收不该清）。
+    """
+    task_id = args.task_id
+    keys = list(getattr(args, "key", None) or [])
+    value = getattr(args, "value", None)
+    with kbc.connect_closing() as conn:
+        if getattr(args, "clear", False):
+            removed = kb.run_state_clear(conn, task_id, keys=keys or None)
+            scope = f"key(s) {', '.join(keys)}" if keys else "all keys"
+            print(f"Cleared {removed} checkpoint(s) for {task_id} ({scope})")
+            return 0
+        if value is not None:
+            if not keys:
+                return _err("kanban: --value 需要配 --key（写哪个断点）", 2)
+            for key in keys:
+                kb.run_state_set(conn, task_id, key, value)
+            print(f"Set {task_id} {', '.join(keys)} = {value}")
+            return 0
+        state = kb.run_state_list(conn, task_id)
+        if keys:
+            for key in keys:
+                print(f"{key} = {state.get(key, '(unset)')}")
+            return 0
+        if not state:
+            print(f"(no checkpoints) {task_id}")
+            return 0
+        for key in sorted(state):
+            print(f"{key} = {state[key]}")
+        return 0
+
+
 def _cmd_reassign(args: argparse.Namespace) -> int:
     profile = _none_profile(args.profile)
     reclaim = bool(getattr(args, "reclaim", False))
@@ -1321,7 +1356,7 @@ _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
     "assign": _cmd_assign, "set-model": _cmd_set_model,
-    "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
+    "reclaim": _cmd_reclaim, "reassign": _cmd_reassign, "state": _cmd_state,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
     "comment": _cmd_comment, "attach": _cmd_attach,

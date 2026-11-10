@@ -258,6 +258,15 @@ _SPECS = [
                   "--provider <name>). Cleared together with the model."),
     ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
     _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
+    _cmd("state", [
+        _TASK_ID,
+        _arg("--key", action="append", metavar="KEY",
+             help="Checkpoint key to read/clear (repeatable); omit to list every key"),
+        _arg("--value", metavar="VALUE",
+             help="Store VALUE under --key (advance the cursor as work progresses)"),
+        _arg("--clear", action="store_true",
+             help="Drop the checkpoint(s): with --key only those keys, bare --clear wipes the task"),
+    ], help="Read, advance or clear a task's resumable checkpoint (survives a reclaim)"),
     _cmd("reassign", [
         _TASK_ID,
         _arg("profile", help="New profile name (or 'none' to unassign)"),

@@ -2429,6 +2429,86 @@ def release_stale_claims(
     return reclaimed
 
 
+# --- 断点续跑层：task_run_state（ZZR patch，t_a1e6a80c 第 7 项）-------------
+#
+# 回收（自动 stale sweep + 手动 ``hermes kanban reclaim``）会换一个新 run；断点必须
+# 跟着任务走，所以本表按 ``task_id`` 键控、不按 run_id。缺表时读操作一律降级为
+# 「没有断点」（None / {}），老库不必先迁移也能安全跑 worker。
+
+_RUN_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS task_run_state (
+    task_id    TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    value      TEXT,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (task_id, key)
+)
+"""
+
+
+def _run_state_table_missing(exc: sqlite3.OperationalError) -> bool:
+    return "no such table" in str(exc).lower()
+
+
+def run_state_get(conn: sqlite3.Connection, task_id: str, key: str) -> Optional[str]:
+    """读一个断点值；缺表或没有该 key 一律 ``None``（只读安全）。"""
+    try:
+        row = conn.execute(
+            "SELECT value FROM task_run_state WHERE task_id = ? AND key = ?", (task_id, key),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if _run_state_table_missing(exc):
+            return None
+        raise
+    return None if row is None else row[0]
+
+
+def run_state_list(conn: sqlite3.Connection, task_id: str) -> dict[str, str]:
+    """列出一个任务的全部断点 ``{key: value}``；缺表返回 ``{}``。"""
+    try:
+        rows = conn.execute(
+            "SELECT key, value FROM task_run_state WHERE task_id = ? ORDER BY key", (task_id,),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        if _run_state_table_missing(exc):
+            return {}
+        raise
+    return {r[0]: r[1] for r in rows}
+
+
+def run_state_set(conn: sqlite3.Connection, task_id: str, key: str, value: str) -> None:
+    """写/覆盖一个断点（推进游标即存）；首次写入时懒建表。"""
+    with write_txn(conn):
+        conn.execute(_RUN_STATE_DDL)
+        conn.execute(
+            "INSERT OR REPLACE INTO task_run_state (task_id, key, value, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            (task_id, key, value, int(time.time())),
+        )
+
+
+def run_state_clear(
+    conn: sqlite3.Connection, task_id: str, keys: Optional[Iterable[str]] = None,
+) -> int:
+    """清档：给 ``keys`` 只清这些 key，否则清该任务全部断点；返回删除行数。"""
+    wanted = list(keys or [])
+    try:
+        with write_txn(conn):
+            if wanted:
+                placeholders = ", ".join(["?"] * len(wanted))
+                cur = conn.execute(
+                    f"DELETE FROM task_run_state WHERE task_id = ? AND key IN ({placeholders})",
+                    (task_id, *wanted),
+                )
+            else:
+                cur = conn.execute("DELETE FROM task_run_state WHERE task_id = ?", (task_id,))
+            return cur.rowcount
+    except sqlite3.OperationalError as exc:
+        if _run_state_table_missing(exc):
+            return 0
+        raise
+
+
 def _record_reclaim(
     conn: sqlite3.Connection, task_id: str, termination: dict, *, error: str, payload: dict,
 ) -> Optional[int]:
@@ -2438,6 +2518,11 @@ def _record_reclaim(
         conn, task_id, outcome="reclaimed", status="reclaimed", error=error, metadata=termination,
     )
     payload.update(termination)
+    # ZZR patch：把当前断点 key 挂进 reclaimed 事件——自动 stale sweep 与手动
+    # reclaim 都过这里，回收后一眼看出新 run 该从哪儿续跑。
+    resume_keys = sorted(run_state_list(conn, task_id))
+    if resume_keys:
+        payload["resume_state_keys"] = resume_keys
     _append_event(conn, task_id, "reclaimed", payload, run_id=run_id)
     return run_id
 
